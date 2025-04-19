@@ -19,7 +19,57 @@ timescale 1ns / 1ps
 // 
 //////////////////////////////////////////////////////////////////////////////////
 
+
+
+
+
+
+module sign_ext(
+    input  [15:0] in,
+    output [31:0] out);
+
+
+  assign out = {{16{in[15]}}, in};
+endmodule
     
+
+
+module mux2 #(parameter WIDTH = 32)(
+  input  [WIDTH-1:0] d0,
+  input  [WIDTH-1:0] d1,
+  input             sel,
+  output [WIDTH-1:0] y
+);
+  assign y = sel ? d1 : d0;
+endmodule
+
+
+
+module mult_hi_lo(
+  input            clk,
+  input            rst,
+  input            start,
+  input            is_signed,
+  input  [31:0]    a,
+  input  [31:0]    b,
+  output reg [31:0] hi,
+  output reg [31:0] lo
+);
+  wire signed [63:0] prod_signed  = $signed(a) * $signed(b);
+  wire        [63:0] prod_unsigned = a * b;
+  wire [63:0] result = is_signed ? prod_signed : prod_unsigned;
+
+  always @(posedge clk or posedge rst) begin
+    if (rst) begin
+      hi <= 0;
+      lo <= 0;
+    end else if (start) begin
+      hi <= result[63:32];
+      lo <= result[31: 0];
+    end
+  end
+endmodule
+
 module alu ( a1, a2, ctrl, out, zero );
 input [31:0] a1, a2;
 input [5:0] ctrl;
@@ -31,7 +81,7 @@ wire[31:0] adder_out;
 wire eq, lt, gt, ge, le;
 fp_comparator comp(a1, a2, eq, lt, gt, le, ge);
 fp_add_or_sum op(a2, ctrl, B_out);
-fp_adder adder(a, B_out, adder_out);
+fp_adder adder(a1, B_out, adder_out);
 
 always @(*) begin
     zero = (out == 0);  
@@ -615,7 +665,7 @@ module fp_add_or_sum(B, ctrl, B_out);
       else B_out <= B;
 
    end
-
+endmodule
 
    
 module fp_adder(
@@ -834,3 +884,133 @@ module fp_comparator (
   assign ge = gt_int || eq; // a is greater than or equal to b when it's greater than or exactly equal to b
 
 endmodule 
+
+
+
+
+module single_cycle(
+  input         clk,
+  input         rst,
+  output [31:0] pc_out
+);
+  // Program Counter wires
+  wire [31:0] pc_in, pc_curr;
+  wire        branch_taken;
+  wire        alu_zero;
+
+  // Instruction fields
+  wire [31:0] instr;
+  wire [5:0]  opcode = instr[31:26];
+  wire [4:0]  rs     = instr[25:21];
+  wire [4:0]  rt     = instr[20:16];
+  wire [4:0]  rd     = instr[15:11];
+  wire [15:0] imm    = instr[15:0];
+  wire [25:0] addr   = instr[25:0];
+  wire [5:0]  funct  = instr[5:0];
+
+  // Control unit signals
+  wire        mem_write, reg_write;
+  wire [1:0]  alu_op;
+  wire [2:0]  alu_branch;
+  wire [1:0]  alu_data;
+  wire [2:0]  alu_imm;
+  wire        mux_alu_src, mux_reg_wr_addr;
+  wire        mux_reg_wr_data, mux_jump;
+  wire        branch;
+  wire [2:0]  fp_instr;
+  wire        fp_1, fp_2;
+
+  ctrl ctl(
+    .opcode(opcode),
+    .mem_write(mem_write),
+    .reg_write(reg_write),
+    .alu_op(alu_op),
+    .alu_data(alu_data),
+    .alu_branch(alu_branch),
+    .alu_imm(alu_imm),
+    .mux_alu_src(mux_alu_src),
+    .mux_reg_write_addr(mux_reg_wr_addr),
+    .mux_reg_write_data(mux_reg_wr_data),
+    .mux_jump(mux_jump),
+    .branch(branch),
+    .fp_instr(fp_instr),
+    .fp_1(fp_1),
+    .fp_2(fp_2)
+  );
+
+  // Instruction memory
+  memory instr_mem(
+    .clk(clk),
+    .write_enable(1'b0),
+    .read_address(pc_curr[11:2]),
+    .write_address(32'b0),
+    .data_in(32'b0),
+    .data_out(instr)
+  );
+
+  // Register file
+  wire [31:0] read_data1, read_data2;
+  register_file rf(
+    .clk(clk), .rst(rst), .we(reg_write),
+    .fp_instr(fp_instr), .fp_1(fp_1), .fp_2(fp_2),
+    .read_address_1(rs), .read_address_2(rt),
+    .write_address(mux_reg_wr_addr ? rd : rt),
+    .write_data(mux_reg_wr_data ? /* data_mem_out */ : /* alu_out */),
+    .read_data_1(read_data1), .read_data_2(read_data2)
+  );
+
+  // Sign-extend immediate
+  wire [31:0] imm_ext;
+  sign_ext se(.in(imm), .out(imm_ext));
+
+  // ALU input MUX
+  wire [31:0] alu_src2;
+  mux2 #(.WIDTH(32)) mux_alu(
+    .d0(read_data2),
+    .d1(imm_ext),
+    .sel(mux_alu_src),
+    .y(alu_src2)
+  );
+
+  // ALU
+  wire [31:0] alu_out;
+  alu alu_unit(
+    .a1(read_data1),
+    .a2(alu_src2),
+    .ctrl(alu_ctrl), // hooked up via alu_ctrl module
+    .out(alu_out),
+    .zero(alu_zero)
+  );
+
+  // Data memory
+  wire [31:0] data_mem_out;
+  memory data_mem(
+    .clk(clk),
+    .write_enable(mem_write),
+    .read_address(alu_out[11:2]),
+    .write_address(alu_out[11:2]),
+    .data_in(read_data2),
+    .data_out(data_mem_out)
+  );
+
+  // PC
+  sign_ext se2(.in(imm), .out(imm_ext)); // reuse or new
+  PC pc_unit(
+    .in_addr(pc_curr),
+    .mux_jump(mux_jump),
+    .instruction(addr),
+    .branch(branch),
+    .alu_zero(alu_zero),
+    .offset(imm_ext),
+    .out_addr(pc_in)
+  );
+
+  // PC register
+  reg [31:0] PC_reg;
+  always @(posedge clk or posedge rst) begin
+    if (rst) PC_reg <= 0;
+    else      PC_reg <= pc_in;
+  end
+  assign pc_curr = PC_reg;
+  assign pc_out  = pc_curr;
+endmodule
